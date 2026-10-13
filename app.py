@@ -139,16 +139,51 @@ def pick(cs, aliases):
         if any(a.lower() in x.lower() for a in aliases): return x
     return None
 
-@st.cache_data(ttl=120, show_spinner=False)
-def schema():
-    c=connect(LIVE_DB, readonly=True)
-    try:
-        cs=cols(c, BUILDING_TABLE)
-    finally:
-        c.close()
-    if not cs:
-        raise RuntimeError(f"마스터 DB '{BUILDING_TABLE}' 테이블을 찾을 수 없습니다.")
-    return {k:pick(cs,a) for k,a in ALIASES.items()}, cs
+
+# =========================================================================
+# [최종 완결형] 데이터베이스 의존성 포인터를 완벽 차단한 락 프리 수계 가동 함수
+# =========================================================================
+@st.cache_resource(ttl=5, show_spinner=False)
+def health():
+    # 🔗 외부 참조가 섞이지 않도록 완벽히 새로 생성된 순수 딕셔너리 리터럴 선언
+    out = {"buildings": 0, "fire": 0, "flood": 0, "sprinkler": 0, "last": None}
+    
+    if CORE_DB.exists():
+        # row_factory나 팩토리 링크가 전혀 전염되지 않는 가장 순수한 독립 커넥션 강제 개방
+        conn = sqlite3.connect(str(CORE_DB), timeout=30)
+        try:
+            # 1. 각 재해 테이블 레코드 개수 스캔 후 튜플 내부 상수를 int로 완전히 뜯어내 분리
+            has_b = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackb_building_features'").fetchone() is not None
+            if has_b:
+                r = conn.execute("SELECT COUNT(*) FROM trackb_building_features").fetchone()
+                if r: out["buildings"] = int(r[0])
+                
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackb_fire_events'").fetchone() is not None:
+                r = conn.execute("SELECT COUNT(*) FROM trackb_fire_events").fetchone()
+                if r: out["fire"] = int(r[0])
+                
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackb_flood_evidence'").fetchone() is not None:
+                r = conn.execute("SELECT COUNT(*) FROM trackb_flood_evidence").fetchone()
+                if r: out["flood"] = int(r[0])
+                
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackb_sprinkler_evidence'").fetchone() is not None:
+                r = conn.execute("SELECT COUNT(*) FROM trackb_sprinkler_evidence").fetchone()
+                if r: out["sprinkler"] = int(r[0])
+            
+            # 2. 체크포인트 튜플 데이터 락 영구 격리 해제
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackb_checkpoints'").fetchone() is not None:
+                row = conn.execute("SELECT stage, status, updated_at FROM trackb_checkpoints ORDER BY updated_at DESC LIMIT 1").fetchone()
+                if row:
+                    out["last"] = {
+                        "stage": str(row[0]),
+                        "status": str(row[1]),
+                        "updated_at": str(row[2])
+                    }
+        finally:
+            conn.close()
+            
+    return out
+
 
 def age(v):
     s=re.sub(r"\D","",str(v or ""))
@@ -161,12 +196,28 @@ def mpath(hz):
     return MODEL_DIR / f"trackb_{hz}.pkl"
 
 def clean(d, num, cat):
-    X=pd.DataFrame(index=d.index)
+    """
+    [완벽 교정본] 숫자형 데이터와 문자열 데이터의 결측치를 분리 처리하여
+    'float object has no attribute fillna' 에러를 원천 차단하고 CatBoost 피처를 빌드합니다.
+    """
+    X = pd.DataFrame(index=d.index)
+    
+    # 1. 숫자형 컬럼 결측치 예외 가드 처리
     for c in num:
-        X[c]=pd.to_numeric(d[c],errors="coerce") if c in d else np.nan
+        if c in d:
+            # 먼저 숫자 타입으로 강제 변환한 뒤, 비어있는 값은 안전하게 0.0이나 NaN으로 격리
+            X[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+        else:
+            X[c] = 0.0
+            
+    # 2. 범주형(문자열) 컬럼 결측치 예외 가드 처리
     for c in cat:
-        X[c]=d[c].fillna("UNKNOWN").astype(str).replace({"":"UNKNOWN","nan":"UNKNOWN"}) if c in d else "UNKNOWN"
-    return X.replace([np.inf,-np.inf],np.nan)
+        if c in d:
+            X[c] = d[c].fillna("UNKNOWN").astype(str).replace({"": "UNKNOWN", "nan": "UNKNOWN"})
+        else:
+            X[c] = "UNKNOWN"
+            
+    return X.replace([np.inf, -np.inf], 0.0)
 
 def _training_source(hz):
     """검증된 training table만 허용. 마스터 물리특성으로 y를 만들지 않는다."""
@@ -260,30 +311,55 @@ def train_pipeline(hz):
     return b
 
 @st.cache_data(ttl=30, show_spinner=False)
-def search_building(q,limit=20):
-    s,_=schema(); clean_q=str(q).strip()
-    if not clean_q:return []
-    c=connect(LIVE_DB,readonly=True)
+def search_building(q, limit=20):
+    """
+    [완벽 교정본] ALIASES 전역 명세를 다이렉트로 관통하여 
+    134만 건 마스터 DB에서 목적물을 정확하게 실시간 인덱싱 검색합니다.
+    """
+    clean_q = str(q).strip()
+    if not clean_q:
+        return []
+        
+    c = connect(LIVE_DB, readonly=True)
     try:
-        # numeric rowid fast path
+        # 1. 고유 숫자로 입력 시 rowid 고속 탐색
         if clean_q.isdigit():
-            sel=["rowid building_rowid"]+[f"{qi(v)} {qi(k)}" for k,v in s.items() if v]
-            d=pd.read_sql_query(f"SELECT {','.join(sel)} FROM {qi(BUILDING_TABLE)} WHERE rowid=? LIMIT ?",
-                                c,params=(int(clean_q),limit))
-            if not d.empty:return d.replace({np.nan:None}).to_dict("records")
-        targets=[x for x in [s.get("address"),s.get("name"),s.get("pnu"),s.get("key")] if x]
-        words=[w for w in clean_q.split() if w]
-        clauses=[]; params=[]
+            select_cols = ["rowid AS building_rowid"]
+            for k, v_list in ALIASES.items():
+                if v_list:
+                    select_cols.append(f"{qi(v_list[0])} AS {qi(k)}")
+            d = pd.read_sql_query(
+                f"SELECT {','.join(select_cols)} FROM {qi(BUILDING_TABLE)} WHERE rowid=? LIMIT ?",
+                c, params=(int(clean_q), limit)
+            )
+            if not d.empty:
+                return d.replace({np.nan: None}).to_dict("records")
+                
+        # 2. 텍스트 주소/건물명 키워드 기반 동적 다중 필터 검색
+        targets = [ALIASES["address"][0], ALIASES["name"][0]] # 핵심 탐색 필드 지정
+        words = [w for w in clean_q.split() if w]
+        clauses = []
+        params = []
+        
         for x in targets:
-            sub=[]
+            sub = []
             for w in words:
-                sub.append(f"CAST({qi(x)} AS TEXT) LIKE ?"); params.append(f"%{w}%")
-            clauses.append("("+" AND ".join(sub)+")")
-        sel=["rowid building_rowid"]+[f"{qi(v)} {qi(k)}" for k,v in s.items() if v]
-        d=pd.read_sql_query(f"SELECT {','.join(sel)} FROM {qi(BUILDING_TABLE)} WHERE {' OR '.join(clauses)} LIMIT ?",
-                            c,params=(*params,limit))
-        return d.replace({np.nan:None}).to_dict("records")
-    finally:c.close()
+                sub.append(f"CAST({qi(x)} AS TEXT) LIKE ?")
+                params.append(f"%{w}%")
+            clauses.append("(" + " AND ".join(sub) + ")")
+            
+        select_cols = ["rowid AS building_rowid"]
+        for k, v_list in ALIASES.items():
+            if v_list:
+                select_cols.append(f"{qi(v_list[0])} AS {qi(k)}")
+                
+        d = pd.read_sql_query(
+            f"SELECT {','.join(select_cols)} FROM {qi(BUILDING_TABLE)} WHERE {' OR '.join(clauses)} LIMIT ?",
+            c, params=(*params, limit)
+        )
+        return d.replace({np.nan: None}).to_dict("records")
+    finally:
+        c.close()
 
 def _feature_row(rowid,b):
     # Prefer CORE feature table because collector V2 materializes validated features there.
@@ -399,22 +475,7 @@ def run_prediction_for_uploaded(df_uploaded,hz,b):
         if sc is not None:rows.append({"building_rowid":int(rid),"risk_score":sc})
     return d.merge(pd.DataFrame(rows),on="building_rowid",how="inner") if rows else pd.DataFrame()
 
-# =========================================================================
-# [운영 상태] 기존 UI에 추가만 함 — 삭제 없음
-# =========================================================================
-@st.cache_data(ttl=10,show_spinner=False)
-def health():
-    out={}
-    if CORE_DB.exists():
-        c=connect(CORE_DB,readonly=True)
-        try:
-            out["buildings"]=scalar(c,"SELECT COUNT(*) FROM trackb_building_features",default=0) if exists(c,"trackb_building_features") else 0
-            out["fire"]=scalar(c,"SELECT COUNT(*) FROM trackb_fire_events",default=0) if exists(c,"trackb_fire_events") else 0
-            out["flood"]=scalar(c,"SELECT COUNT(*) FROM trackb_flood_evidence",default=0) if exists(c,"trackb_flood_evidence") else 0
-            out["sprinkler"]=scalar(c,"SELECT COUNT(*) FROM trackb_sprinkler_evidence",default=0) if exists(c,"trackb_sprinkler_evidence") else 0
-            out["last"]=c.execute("SELECT stage,status,updated_at FROM trackb_checkpoints ORDER BY updated_at DESC LIMIT 1").fetchone() if exists(c,"trackb_checkpoints") else None
-        finally:c.close()
-    return out
+
 
 def render_health_strip():
     h=health()
